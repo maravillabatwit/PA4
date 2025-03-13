@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 extern int* imageToMat(char* name, int* dims);
 extern void matToImage(char* name, int* mat, int* dims);
@@ -13,88 +14,103 @@ void applyConvolution(int* matrix, int* temp, int height, int width, int k) {
             int index = i * width + j;
             int sum = 0;
             int counter = 0;
-
-            // Convolution sum
             for (int u = -kHalf; u <= kHalf; u++) {
                 for (int v = -kHalf; v <= kHalf; v++) {
                     int ci = i + u;
                     int cj = j + v;
                     int cindex = ci * width + cj;
                     if (ci >= 0 && ci < height && cj >= 0 && cj < width) {
-                        sum += matrix[cindex]; // Simple average convolution (no kernel weights)
+                        sum += matrix[cindex];
                         counter++;
                     }
                 }
             }
-            temp[index] = sum / counter; // Average the sum
+            temp[index] = sum / counter;
         }
     }
 }
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-
     int rank, size;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     int* matrix = NULL;
     int* temp = NULL;
-    int* dims = NULL;
+    int* dims = (int*)malloc(2 * sizeof(int));
+    double total_time = 0.0, comm_time = 0.0, calc_time = 0.0;
 
     if (rank == 0) {
-        // 1. Read image on rank 0
-        dims = (int*)malloc(2 * sizeof(int));
         matrix = imageToMat("image.jpg", dims);
         if (!matrix || !dims) {
-            printf("Error loading image\n");
+            printf("Rank 0: Failed to load image\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
         temp = (int*)malloc(dims[0] * dims[1] * sizeof(int));
     }
 
-    // 2. Broadcast dimensions
-    int local_dims[2];
     MPI_Bcast(dims, 2, MPI_INT, 0, MPI_COMM_WORLD);
     int height = dims[0];
     int width = dims[1];
 
-    // Allocate memory on all ranks
     if (rank != 0) {
         matrix = (int*)malloc(height * width * sizeof(int));
         temp = (int*)malloc(height * width * sizeof(int));
     }
 
-    // 3. Broadcast image data
+    double start_total = MPI_Wtime();
     MPI_Bcast(matrix, height * width, MPI_INT, 0, MPI_COMM_WORLD);
+    printf("Rank %d: matrix[0]=%d, matrix[1]=%d\n", rank, matrix[0], matrix[1]);
 
-    // 4. Compute local portion
     int rows_per_rank = height / size;
-    int start_row = rank * rows_per_rank;
-    int end_row = (rank == size - 1) ? height : start_row + rows_per_rank;
+    int remainder = height % size;
+    int start_row = rank * rows_per_rank + (rank < remainder ? rank : remainder);
+    int end_row = start_row + rows_per_rank + (rank < remainder ? 1 : 0);
     int local_height = end_row - start_row;
 
     int* local_matrix = matrix + start_row * width;
     int* local_temp = temp + start_row * width;
 
-    int k = 10; // Kernel size
-    applyConvolution(local_matrix, local_temp, local_height, width, k);
+    // Copy matrix to temp to ensure full array is initialized
+    memcpy(temp, matrix, height * width * sizeof(int));
+    double start_calc = MPI_Wtime();
+    applyConvolution(local_matrix, local_temp, local_height, width, 10);
+    double end_calc = MPI_Wtime();
+    calc_time = end_calc - start_calc;
+    printf("Rank %d: local_temp[0]=%d\n", rank, local_temp[0]);
 
-    // 5. Gather results to rank 0
-    MPI_Gather(local_temp, local_height * width, MPI_INT,
-               temp, local_height * width, MPI_INT,
-               0, MPI_COMM_WORLD);
-
-    // 6. Save image on rank 0
+    int* recv_counts = NULL;
+    int* displacements = NULL;
     if (rank == 0) {
-        matToImage("processedImage.jpg", temp, dims);
-        free(matrix);
-        free(temp);
-        free(dims);
-    } else {
-        free(matrix);
-        free(temp);
+        recv_counts = (int*)malloc(size * sizeof(int));
+        displacements = (int*)malloc(size * sizeof(int));
+        for (int i = 0; i < size; i++) {
+            int local_rows = rows_per_rank + (i < remainder ? 1 : 0);
+            recv_counts[i] = local_rows * width;
+            displacements[i] = i * rows_per_rank * width + (i < remainder ? i : remainder) * width;
+        }
     }
+
+    double start_gather = MPI_Wtime();
+    MPI_Gatherv(local_temp, local_height * width, MPI_INT,
+                temp, recv_counts, displacements, MPI_INT,
+                0, MPI_COMM_WORLD);
+    double end_gather = MPI_Wtime();
+    comm_time = end_gather - start_gather;
+
+    double end_total = MPI_Wtime();
+    total_time = end_total - start_total;
+
+    if (rank == 0) {
+        printf("Rank 0: temp[0]=%d, temp[%d]=%d\n", temp[0], width, temp[width]);
+        matToImage("output2.jpg", temp, dims);
+        free(recv_counts);
+        free(displacements);
+    }
+    free(matrix);
+    free(temp);
+    free(dims);
 
     MPI_Finalize();
     return 0;
